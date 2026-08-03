@@ -1,0 +1,27 @@
+# ─── MedCart Requirements ─────────────────────────────────────────────────────
+# Install inside venv:
+#   python3 -m venv venv
+#   source venv/bin/activate
+#   pip install -r requirements.txt
+#
+# RPi-only packages (mfrc522, RPi.GPIO) will fail on non-Pi machines — that's
+# fine. rfid_node.py auto-detects and falls back to simulator mode.
+
+# ─── MQTT ─────────────────────────────────────────────────────────────────────
+paho-mqtt>=1.6.1
+
+# ─── Telegram bot ─────────────────────────────────────────────────────────────
+python-telegram-bot>=20.0
+
+# ─── Database ─────────────────────────────────────────────────────────────────
+# sqlite3 is built into Python — no install needed
+
+# ─── Arduino serial communication ────────────────────────────────────────────
+pyserial>=3.5
+
+# ─── RPi hardware (only needed if connecting RC522 directly to Pi, not via Arduino) ──
+# mfrc522>=0.0.7
+# RPi.GPIO>=0.7.1
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0        # for .env config (MQTT broker IP, Telegram token, etc.)
