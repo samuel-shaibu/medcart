@@ -1,15 +1,14 @@
 """
 telegram_bot.py — MedCart Telegram operator interface
-Receives notifications from coordinator via MQTT and displays them to the nurse.
-Sends commands back to coordinator via MQTT (dispense, movement, status).
 
 Commands:
-    /start      — welcome message
-    /patient    — show current active patient info
-    /dispense   — show dispense menu for active patient
-    /vitals     — show latest vitals for active patient
-    /status     — system status
-    /move       — movement control pad
+    /start    — welcome message
+    /patient  — active patient info
+    /dispense — dispense tray for active patient
+    /vitals   — latest vitals
+    /scan     — trigger CV bed number scan
+    /move     — movement control pad
+    /status   — system status
 
 Run: python3 nodes/telegram_bot.py
 """
@@ -35,7 +34,6 @@ from telegram.ext import (
 )
 from telegram.error import TimedOut, NetworkError
 
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "core"))
 
 load_dotenv()
@@ -52,8 +50,9 @@ SUB_PATIENT      = "medcart/patient/identified"
 SUB_VITALS_ALERT = "medcart/vitals/alert"
 SUB_STATUS       = "medcart/system/status"
 
-PUB_DISPENSE     = "medcart/dispense/command"
+PUB_DISPENSE     = "medcart/dispense/request"     # updated topic
 PUB_MOVEMENT     = "medcart/movement/command"
+PUB_CV_TRIGGER   = "medcart/cv/trigger"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,12 +63,8 @@ log = logging.getLogger("telegram_bot")
 # ─── Shared state ─────────────────────────────────────────────────────────────
 
 active_patient: dict | None = None
-
-# Thread-safe queue: MQTT thread puts messages here, async loop sends them
-message_queue: queue.Queue = queue.Queue()
-
-# MQTT client
-mqtt_client: mqtt.Client | None = None
+message_queue:  queue.Queue = queue.Queue()
+mqtt_client:    mqtt.Client | None = None
 
 
 # ─── MQTT ─────────────────────────────────────────────────────────────────────
@@ -139,10 +134,9 @@ def start_mqtt():
         sys.exit(1)
 
 
-# ─── Queue worker — drains message_queue and sends to Telegram ───────────────
+# ─── Queue worker ─────────────────────────────────────────────────────────────
 
 async def queue_worker(app: Application):
-    """Runs as an async task, sends queued messages to Telegram."""
     while True:
         await asyncio.sleep(0.2)
         while not message_queue.empty():
@@ -155,8 +149,8 @@ async def queue_worker(app: Application):
                         parse_mode = "HTML"
                     )
                 except (TimedOut, NetworkError) as e:
-                    log.warning("Telegram send failed (will retry): %s", e)
-                    message_queue.put(text)   # put it back
+                    log.warning("Telegram send failed (retrying): %s", e)
+                    message_queue.put(text)
                     await asyncio.sleep(2)
             except queue.Empty:
                 break
@@ -167,12 +161,13 @@ async def queue_worker(app: Application):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 <b>MedCart Control Panel</b>\n\n"
-        "Available commands:\n"
-        "/patient — active patient info\n"
-        "/dispense — dispense medication\n"
-        "/vitals — latest vitals\n"
-        "/move — movement controls\n"
-        "/status — system status",
+        "Commands:\n"
+        "/patient  — active patient info\n"
+        "/dispense — dispense medication tray\n"
+        "/vitals   — latest vitals\n"
+        "/scan     — scan bed number (CV)\n"
+        "/move     — movement controls\n"
+        "/status   — system status",
         parse_mode="HTML"
     )
 
@@ -182,28 +177,24 @@ async def cmd_patient(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ No patient identified yet. Scan a wristband.")
         return
 
-    p = active_patient
-    prescriptions = p.get("prescriptions", [])
-    rx_lines = "\n".join(
-        f"  • {rx['med_name']} — {rx['dosage']} {rx['unit']} @ {rx['frequency']}"
-        for rx in prescriptions
-    ) or "  None"
+    p         = active_patient
+    allergies = ", ".join(p.get("allergies", [])) or "None"
+    slot      = p.get("slot_number")
+    slot_text = f"Slot {slot}" if slot else "⚠️ No slot assigned"
 
     vitals = p.get("latest_vitals")
     vitals_text = (
         f"  🌡 Temp: {vitals.get('temperature_c', '—')}°C\n"
+        f"  💧 Humidity: {vitals.get('humidity_pct', '—')}%\n"
         f"  💓 HR: {vitals.get('heart_rate_bpm', '—')} bpm\n"
-        f"  🩸 SpO2: {vitals.get('spo2_pct', '—')}%\n"
-        f"  💊 BP: {vitals.get('bp_systolic', '—')}/{vitals.get('bp_diastolic', '—')} mmHg"
+        f"  🩸 SpO2: {vitals.get('spo2_pct', '—')}%"
     ) if vitals else "  No vitals recorded yet"
-
-    allergies = ", ".join(p.get("allergies", [])) or "None"
 
     await update.message.reply_text(
         f"👤 <b>{p['full_name']}</b>\n"
         f"🏥 {p['ward']} — Bed {p['bed_number']}\n"
+        f"💊 Tray: {slot_text}\n"
         f"⚠️ Allergies: {allergies}\n\n"
-        f"💊 <b>Prescriptions:</b>\n{rx_lines}\n\n"
         f"📊 <b>Latest Vitals:</b>\n{vitals_text}",
         parse_mode="HTML"
     )
@@ -214,22 +205,30 @@ async def cmd_dispense(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ No patient identified yet. Scan a wristband.")
         return
 
-    prescriptions = active_patient.get("prescriptions", [])
-    if not prescriptions:
-        await update.message.reply_text("⚠️ No active prescriptions for this patient.")
+    p    = active_patient
+    slot = p.get("slot_number")
+
+    if not slot:
+        await update.message.reply_text(
+            f"⚠️ No tray slot assigned to {p['full_name']}.\n"
+            f"Update patient record with a slot number via admin.py."
+        )
         return
 
     keyboard = [
         [InlineKeyboardButton(
-            f"💊 {rx['med_name']} ({rx['dosage']} {rx['unit']})",
-            callback_data=f"dispense:{rx['medication_id']}:{rx['med_name']}:{rx['dosage']}"
-        )]
-        for rx in prescriptions
+            f"✅ Dispense tray for {p['full_name']} (Slot {slot})",
+            callback_data=f"dispense:{p['patient_id']}:{slot}"
+        )],
+        [InlineKeyboardButton("❌ Cancel", callback_data="dispense:cancel")]
     ]
-    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="dispense:cancel")])
 
     await update.message.reply_text(
-        f"Select medication to dispense for <b>{active_patient['full_name']}</b>:",
+        f"💊 <b>Dispense medication tray</b>\n\n"
+        f"👤 Patient: {p['full_name']}\n"
+        f"🏥 Bed: {p['bed_number']}\n"
+        f"📦 Tray slot: {slot}\n\n"
+        f"⚠️ Bed must be confirmed by camera before dispensing.",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="HTML"
     )
@@ -248,11 +247,18 @@ async def cmd_vitals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📊 <b>Latest Vitals — {active_patient['full_name']}</b>\n"
         f"🌡 Temperature: {vitals.get('temperature_c', '—')}°C\n"
+        f"💧 Humidity: {vitals.get('humidity_pct', '—')}%\n"
         f"💓 Heart rate: {vitals.get('heart_rate_bpm', '—')} bpm\n"
         f"🩸 SpO2: {vitals.get('spo2_pct', '—')}%\n"
-        f"💊 BP: {vitals.get('bp_systolic', '—')}/{vitals.get('bp_diastolic', '—')} mmHg\n"
         f"🕐 Recorded: {vitals.get('recorded_at', '—')}",
         parse_mode="HTML"
+    )
+
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mqtt_publish(PUB_CV_TRIGGER, {"timestamp": datetime.now().isoformat()})
+    await update.message.reply_text(
+        "📷 Scanning for bed number…\nPoint the camera at the bed number sign."
     )
 
 
@@ -275,9 +281,8 @@ async def cmd_move(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     patient_info = (
-        f"👤 Active patient: {active_patient['full_name']}"
-        if active_patient else
-        "👤 No patient identified"
+        f"👤 {active_patient['full_name']} — Bed {active_patient['bed_number']}"
+        if active_patient else "👤 No patient identified"
     )
     await update.message.reply_text(
         f"📡 <b>System Status</b>\n"
@@ -295,6 +300,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data  = query.data
 
+    # ── Movement ──
     if data.startswith("move:"):
         direction = data.split(":")[1]
         mqtt_publish(PUB_MOVEMENT, {
@@ -317,28 +323,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
 
+    # ── Dispense cancel ──
     elif data == "dispense:cancel":
         await query.edit_message_text("❌ Dispense cancelled.")
 
+    # ── Dispense confirm ──
     elif data.startswith("dispense:"):
-        parts = data.split(":", 3)
-        if len(parts) < 4:
+        parts = data.split(":")
+        if len(parts) < 3:
             return
-        _, med_id, med_name, quantity = parts
+        _, patient_id, slot = parts
+
         if not active_patient:
             await query.edit_message_text("⚠️ No active patient.")
             return
+
+        # Send dispense request to coordinator
+        # Coordinator will verify bed match before executing
         mqtt_publish(PUB_DISPENSE, {
-            "patient_id":      active_patient["patient_id"],
-            "medication_id":   int(med_id),
-            "medication_name": med_name,
-            "quantity":        float(quantity),
-            "requested_by":    f"telegram:{query.from_user.id}",
-            "timestamp":       datetime.now().isoformat()
+            "patient_id":   int(patient_id),
+            "slot_number":  int(slot),
+            "requested_by": f"telegram:{query.from_user.id}",
+            "timestamp":    datetime.now().isoformat()
         })
+
         await query.edit_message_text(
-            f"💊 Dispensing <b>{quantity} × {med_name}</b> for "
-            f"<b>{active_patient['full_name']}</b>…",
+            f"💊 Dispense request sent for <b>{active_patient['full_name']}</b>\n"
+            f"Slot {slot} — awaiting bed verification…",
             parse_mode="HTML"
         )
 
@@ -346,7 +357,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 async def post_init(app: Application):
-    """Start the queue worker after the app initialises."""
     asyncio.create_task(queue_worker(app))
     log.info("Queue worker started")
 
@@ -373,21 +383,20 @@ def main():
     app.add_handler(CommandHandler("patient",  cmd_patient))
     app.add_handler(CommandHandler("dispense", cmd_dispense))
     app.add_handler(CommandHandler("vitals",   cmd_vitals))
+    app.add_handler(CommandHandler("scan",     cmd_scan))
     app.add_handler(CommandHandler("move",     cmd_move))
     app.add_handler(CommandHandler("status",   cmd_status))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    log.info("Telegram bot running…")
-
     async def error_handler(update, context):
         if isinstance(context.error, (TimedOut, NetworkError)):
-            log.warning("Network timeout — will retry automatically.")
+            log.warning("Network timeout — retrying automatically.")
         else:
             log.error("Unexpected error: %s", context.error)
 
-    # Add this line inside main() before app.run_polling:
     app.add_error_handler(error_handler)
 
+    log.info("Telegram bot running…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
