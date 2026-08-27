@@ -1,17 +1,13 @@
 """
-vitals_node.py — MedCart vitals reading node
+vitals_node.py — MedCart vitals reading node (Pi 4 Direct I2C)
 Listens for vitals trigger from coordinator via MQTT,
-sends {"cmd":"vitals"} to Arduino over serial,
-receives MAX30102 SpO2 and heart rate JSON,
+reads directly from MAX30102 sensor via I2C,
 publishes result back to coordinator via MQTT.
 
 MQTT:
     Subscribes: medcart/vitals/trigger   ← coordinator triggers reading
     Publishes:  medcart/vitals/reading   ← SpO2 + HR result
-
-Serial to Arduino:
-    Send:    {"cmd":"vitals"}\n
-    Receive: {"type":"vitals","spo2":98,"hr":72,"valid":true}
+    Publishes:  medcart/vitals/error     ← Error messages
 
 Run: python3 nodes/vitals_node.py
 """
@@ -25,8 +21,6 @@ import logging
 import threading
 from datetime import datetime
 
-import serial
-import serial.tools.list_ports
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
 
@@ -34,18 +28,12 @@ load_dotenv()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-SERIAL_PORT  = os.getenv("ARDUINO_PORT", "/dev/ttyUSB0")
-SERIAL_BAUD  = int(os.getenv("ARDUINO_BAUD", "9600"))
 MQTT_BROKER  = os.getenv("MQTT_BROKER", "localhost")
 MQTT_PORT    = int(os.getenv("MQTT_PORT", "1883"))
 
 SUB_TRIGGER  = "medcart/vitals/trigger"
 PUB_READING  = "medcart/vitals/reading"
 PUB_ERROR    = "medcart/vitals/error"
-
-# Timeout waiting for Arduino vitals response (seconds)
-# MAX30102 needs ~4 seconds to collect 100 samples at 100Hz
-VITALS_TIMEOUT = 10
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,114 +42,77 @@ logging.basicConfig(
 log = logging.getLogger("vitals_node")
 
 
-# ─── Serial ───────────────────────────────────────────────────────────────────
+# ─── Sensor Initialization ────────────────────────────────────────────────────
 
-def find_arduino_port() -> str | None:
-    for port in serial.tools.list_ports.comports():
-        desc = (port.description or "").lower()
-        if any(k in desc for k in ("arduino", "ch340", "cp210", "ftdi", "usb serial")):
-            log.info("Auto-detected Arduino on %s", port.device)
-            return port.device
-    return None
-
-
-def open_serial() -> serial.Serial | None:
-    port = SERIAL_PORT
-    if not os.path.exists(port):
-        detected = find_arduino_port()
-        if detected:
-            port = detected
-        else:
-            log.warning("Arduino not found — running in simulator mode.")
-            return None
-
-    ser = serial.Serial(port, SERIAL_BAUD, timeout=VITALS_TIMEOUT)
-    time.sleep(2)
-    log.info("Serial open: %s @ %d baud", port, SERIAL_BAUD)
-    return ser
+def open_sensor():
+    """Attempt to initialize the MAX30102 sensor over I2C."""
+    try:
+        from max30102 import MAX30102
+        sensor = MAX30102()
+        log.info("MAX30102 sensor initialized via I2C")
+        return sensor
+    except Exception as e:
+        log.warning("MAX30102 not found or library missing (%s) — running in simulator mode.", e)
+        return None
 
 
 # ─── Vitals reading ───────────────────────────────────────────────────────────
 
-def request_vitals(ser: serial.Serial, patient_id: int,
-                   client: mqtt.Client):
+def request_vitals(sensor, patient_id: int, client: mqtt.Client):
     """
-    Send vitals command to Arduino and wait for response.
+    Reads directly from MAX30102 and filters the data.
     Runs in a background thread so MQTT loop isn't blocked.
-    MAX30102 takes ~4 seconds to collect samples.
     """
     log.info("Requesting vitals for patient %d…", patient_id)
 
     try:
-        # Flush any stale data
-        ser.reset_input_buffer()
+        from max30102 import hrcalc
+        
+        # Take up to 4 sequential readings (approx 1-2 seconds each) 
+        # to allow the sensor to stabilize and find a valid reading
+        max_attempts = 4
+        
+        for attempt in range(max_attempts):
+            # read_sequential() blocks while it gathers 100 samples
+            red, ir = sensor.read_sequential()
+            hr, hr_valid, spo2, spo2_valid = hrcalc.calc_hr_and_spo2(ir, red)
+            
+            # Apply strict filtering to ignore -999 and physically impossible bounds
+            if hr_valid and spo2_valid and spo2 != -999 and hr != -999:
+                if 40 <= hr <= 150 and 90 <= spo2 <= 100:
+                    payload = {
+                        "patient_id":    patient_id,
+                        "spo2_pct":      float(spo2),
+                        "heart_rate_bpm": int(hr),
+                        "timestamp":     datetime.now().isoformat()
+                    }
+                    client.publish(PUB_READING, json.dumps(payload), qos=1)
+                    log.info("Vitals published: SpO2=%.1f%% HR=%dbpm", spo2, hr)
+                    return
+                else:
+                    log.debug("Reading out of bounds (Attempt %d): HR=%s, SpO2=%s", attempt + 1, hr, spo2)
 
-        # Send command to Arduino
-        ser.write(b'{"cmd":"vitals"}\n')
-        log.info("Sent vitals command to Arduino")
-
-        # Wait for response — read lines until we get vitals type
-        deadline = time.time() + VITALS_TIMEOUT
-        while time.time() < deadline:
-            raw = ser.readline().decode("utf-8").strip()
-            if not raw:
-                continue
-
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-
-            if data.get("type") != "vitals":
-                continue
-
-            # Got vitals response
-            valid   = data.get("valid", False)
-            spo2    = data.get("spo2", -1)
-            hr      = data.get("hr", -1)
-
-            if valid and spo2 > 0 and hr > 0:
-                payload = {
-                    "patient_id":    patient_id,
-                    "spo2_pct":      float(spo2),
-                    "heart_rate_bpm": int(hr),
-                    "timestamp":     datetime.now().isoformat()
-                }
-                client.publish(PUB_READING, json.dumps(payload), qos=1)
-                log.info("Vitals published: SpO2=%s%% HR=%sbpm", spo2, hr)
-            else:
-                # Sensor returned invalid reading
-                client.publish(PUB_ERROR, json.dumps({
-                    "patient_id": patient_id,
-                    "error":      "invalid_reading",
-                    "message":    "Place finger firmly on sensor and try again.",
-                    "raw":        data,
-                    "timestamp":  datetime.now().isoformat()
-                }), qos=1)
-                log.warning("Invalid vitals reading: %s", data)
-            return
-
-        # Timed out
-        log.error("Vitals timeout — no response from Arduino")
+        # Timed out / exhausted attempts with noisy data
+        log.warning("Invalid vitals reading — signal too noisy or finger not detected.")
         client.publish(PUB_ERROR, json.dumps({
             "patient_id": patient_id,
-            "error":      "timeout",
-            "message":    "Arduino did not respond in time. Check sensor connection.",
+            "error":      "invalid_reading",
+            "message":    "Place finger firmly on sensor and try again.",
             "timestamp":  datetime.now().isoformat()
         }), qos=1)
 
-    except serial.SerialException as e:
-        log.error("Serial error during vitals read: %s", e)
+    except Exception as e:
+        log.error("Sensor error during vitals read: %s", e)
         client.publish(PUB_ERROR, json.dumps({
             "patient_id": patient_id,
-            "error":      "serial_error",
+            "error":      "sensor_error",
             "message":    str(e),
             "timestamp":  datetime.now().isoformat()
         }), qos=1)
 
 
 def simulate_vitals(patient_id: int, client: mqtt.Client):
-    """Simulator mode when no Arduino connected."""
+    """Simulator mode when no hardware is connected."""
     import random
     log.info("SIMULATOR: generating fake vitals for patient %d", patient_id)
     time.sleep(2)   # simulate reading delay
@@ -182,7 +133,7 @@ def simulate_vitals(patient_id: int, client: mqtt.Client):
 
 # ─── MQTT ─────────────────────────────────────────────────────────────────────
 
-def build_mqtt_client(ser: serial.Serial | None) -> mqtt.Client:
+def build_mqtt_client(sensor) -> mqtt.Client:
     client = mqtt.Client(
         mqtt.CallbackAPIVersion.VERSION2,
         client_id="vitals_node",
@@ -208,10 +159,10 @@ def build_mqtt_client(ser: serial.Serial | None) -> mqtt.Client:
         log.info("Vitals trigger received for patient %d", patient_id)
 
         # Run in background thread — reading takes several seconds
-        if ser:
+        if sensor:
             t = threading.Thread(
                 target=request_vitals,
-                args=(ser, patient_id, c),
+                args=(sensor, patient_id, c),
                 daemon=True
             )
         else:
@@ -230,8 +181,8 @@ def build_mqtt_client(ser: serial.Serial | None) -> mqtt.Client:
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 def main():
-    ser    = open_serial()
-    client = build_mqtt_client(ser)
+    sensor = open_sensor()
+    client = build_mqtt_client(sensor)
 
     try:
         client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
@@ -242,8 +193,6 @@ def main():
 
     def shutdown(sig, frame):
         log.info("Shutting down vitals_node…")
-        if ser:
-            ser.close()
         client.loop_stop()
         client.disconnect()
         sys.exit(0)
@@ -251,7 +200,7 @@ def main():
     signal.signal(signal.SIGINT,  shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    mode = "hardware" if ser else "simulator"
+    mode = "hardware" if sensor else "simulator"
     log.info("Vitals node running (%s mode). Waiting for trigger…", mode)
 
     # Keep main thread alive
