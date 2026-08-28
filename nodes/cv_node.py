@@ -360,7 +360,8 @@ def run_continuous(client: mqtt.Client, scanner: BedScanner):
 
     while True:
         frame = scanner.capture_frame()
-        if frame:
+        # CHANGE THIS LINE BELOW:
+        if frame is not None:
             bed, conf = scanner.scan_frame(frame)
             if bed:
                 now = time.time()
