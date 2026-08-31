@@ -460,7 +460,14 @@ def main():
     scan_thread.start()
 
     log.info("CV node running — continuous scan + manual trigger active.")
-    client.loop_forever()
+    
+    # Keep the main thread alive without interfering with MQTT
+    import time
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
