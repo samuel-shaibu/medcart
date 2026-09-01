@@ -196,6 +196,13 @@ def handle_rfid_scan(client: mqtt.Client, payload: dict):
 
     notify(client, ctx.summary(), level="info")
 
+    # Auto-trigger vitals reading
+    publish(client, PUB_VITALS_TRIGGER, {
+        "patient_id": ctx.patient_id,
+        "timestamp":  datetime.now().isoformat()
+    })
+    log.info("Vitals trigger sent for patient %d", ctx.patient_id)
+
     # Immediately check bed match
     _check_bed_match(client)
 
