@@ -19,6 +19,8 @@ import os
 import json
 import logging
 import signal
+import threading
+import time
 from datetime import datetime
 
 import paho.mqtt.client as mqtt
@@ -43,6 +45,7 @@ SUB_DISPENSE_STATUS  = "medcart/dispense/status"     # from dispenser_node resul
 SUB_VITALS_READING   = "medcart/vitals/reading"
 SUB_CV_DETECTED      = "medcart/cv/bed_detected"
 SUB_CV_ERROR         = "medcart/cv/error"
+PUB_VITALS_TRIGGER   = "medcart/vitals/trigger"
 
 # Topics published to
 PUB_PATIENT          = "medcart/patient/identified"
@@ -121,21 +124,9 @@ def handle_cv_error(client: mqtt.Client, payload: dict):
 
 
 def _check_bed_match(client: mqtt.Client) -> bool:
-    """
-    Cross-check active patient's bed against CV-detected bed.
-    Returns True if match, False if mismatch or missing.
-    Sends Telegram notification either way.
-    """
     global active_patient, active_bed
 
-    if not active_patient:
-        return False
-
-    if not active_bed:
-        notify(client,
-               f"⚠️ Patient identified but bed not yet confirmed.\n"
-               f"Point camera at the bed number sign.",
-               level="warning")
+    if not active_patient or not active_bed:
         return False
 
     patient_bed = str(active_patient.bed_number).strip()
@@ -144,20 +135,25 @@ def _check_bed_match(client: mqtt.Client) -> bool:
         log.info("Bed match confirmed: patient=%s bed=%s", active_patient.full_name, active_bed)
         notify(client,
                f"✅ Location confirmed — Bed {active_bed}\n"
-               f"👤 {active_patient.full_name} is assigned to this bed.\n"
-               f"💊 Tap /dispense to release tray (Slot {active_patient.slot_number})",
+               f"👤 {active_patient.full_name} is assigned here.\n"
+               f"⏱️ Taking vitals in 4 seconds. Place finger on sensor.",
                level="info")
+        
+        # Fire vitals trigger after grace period in a non-blocking thread
+        def delayed_trigger():
+            time.sleep(4)
+            publish(client, PUB_VITALS_TRIGGER, {
+                "patient_id": active_patient.patient_id,
+                "timestamp":  datetime.now().isoformat()
+            })
+            log.info("Vitals triggered for patient %d", active_patient.patient_id)
+            
+        threading.Thread(target=delayed_trigger, daemon=True).start()
         return True
     else:
         log.warning("Bed mismatch: patient bed=%s, CV bed=%s", patient_bed, active_bed)
-        notify(client,
-               f"⛔ WRONG BED\n"
-               f"📷 Camera sees: Bed {active_bed}\n"
-               f"👤 {active_patient.full_name} belongs to: Bed {patient_bed}\n"
-               f"Move cart to the correct bed before dispensing.",
-               level="error")
+        notify(client, f"⛔ WRONG BED. Camera sees: Bed {active_bed}", level="error")
         return False
-
 
 # ─── RFID handler ─────────────────────────────────────────────────────────────
 
@@ -197,11 +193,11 @@ def handle_rfid_scan(client: mqtt.Client, payload: dict):
     notify(client, ctx.summary(), level="info")
 
     # Auto-trigger vitals reading
-    publish(client, PUB_VITALS_TRIGGER, {
-        "patient_id": ctx.patient_id,
-        "timestamp":  datetime.now().isoformat()
-    })
-    log.info("Vitals trigger sent for patient %d", ctx.patient_id)
+    # publish(client, PUB_VITALS_TRIGGER, {
+    #    "patient_id": ctx.patient_id,
+    #   "timestamp":  datetime.now().isoformat()
+    # })
+    #log.info("Vitals trigger sent for patient %d", ctx.patient_id)
 
     # Immediately check bed match
     _check_bed_match(client)
@@ -216,7 +212,6 @@ def handle_rfid_error(client: mqtt.Client, payload: dict):
     else:
         notify(client, f"🔴 RFID error: {error}", level="error")
 
-
 # ─── Dispense handlers ────────────────────────────────────────────────────────
 
 def handle_dispense_request(client: mqtt.Client, payload: dict):
@@ -226,18 +221,22 @@ def handle_dispense_request(client: mqtt.Client, payload: dict):
     """
     global active_patient, active_bed
 
-    patient_id   = payload.get("patient_id")
-    requested_by = payload.get("requested_by", "telegram")
+    req_patient_id = payload.get("patient_id")
+    requested_by   = payload.get("requested_by", "telegram")
 
     if not active_patient:
         notify(client, "⚠️ No patient identified. Scan RFID wristband first.", level="warning")
         return
 
-    if active_patient.patient_id != patient_id:
+    # SAFETY NET 1: If Telegram drops the ID, fallback to the active patient
+    if req_patient_id is None:
+        req_patient_id = active_patient.patient_id
+
+    # Safely compare IDs as strings to prevent network type mismatches
+    if str(active_patient.patient_id) != str(req_patient_id):
         notify(client, "⚠️ Patient mismatch. Scan wristband again.", level="warning")
         return
 
-    # Hard gate: bed must be confirmed and must match
     if not active_bed:
         notify(client,
                "⛔ Dispense blocked — bed not confirmed.\n"
@@ -260,14 +259,16 @@ def handle_dispense_request(client: mqtt.Client, payload: dict):
                level="error")
         return
 
-    # All checks passed — send to dispenser
+    # GUARANTEE the patient_id is an integer so the SQLite database doesn't crash
+    safe_patient_id = int(active_patient.patient_id) if active_patient.patient_id is not None else 0
+
     log.info("Dispense approved: patient=%s slot=%d bed=%s",
              active_patient.full_name, active_patient.slot_number, active_bed)
 
     publish(client, PUB_DISPENSE_EXECUTE, {
-        "patient_id":   active_patient.patient_id,
+        "patient_id":   safe_patient_id,
         "full_name":    active_patient.full_name,
-        "slot_number":  active_patient.slot_number,
+        "slot_number":  int(active_patient.slot_number),
         "bed_confirmed": active_bed,
         "requested_by": requested_by,
         "timestamp":    datetime.now().isoformat()
@@ -281,13 +282,26 @@ def handle_dispense_request(client: mqtt.Client, payload: dict):
 
 def handle_dispense_status(client: mqtt.Client, payload: dict):
     """Result back from dispenser_node."""
+    global active_patient
+    
     status      = payload.get("status", "unknown")
     patient_id  = payload.get("patient_id")
     slot_number = payload.get("slot_number")
     bed         = payload.get("bed_confirmed")
     msg         = payload.get("msg", "")
 
-    if status == "success":
+    # SAFETY NET 2: Catch missing IDs returning from the dispenser node
+    if patient_id is None and active_patient:
+        patient_id = active_patient.patient_id
+
+    # Ensure patient_id is an integer for the database
+    try:
+        patient_id = int(patient_id)
+    except (TypeError, ValueError):
+        patient_id = 0
+
+    # The Arduino returns "ok", but simulator returns "success". Accept both!
+    if status in ("success", "ok"):
         log_dispense(patient_id, slot_number,
                      dispensed_by="auto", status="success",
                      bed_confirmed=bed)
@@ -300,7 +314,6 @@ def handle_dispense_status(client: mqtt.Client, payload: dict):
                      dispensed_by="auto", status="failed",
                      bed_confirmed=bed, notes=msg)
         notify(client, f"🔴 Dispense failed: {msg}", level="error")
-
 
 # ─── Vitals handler ───────────────────────────────────────────────────────────
 
