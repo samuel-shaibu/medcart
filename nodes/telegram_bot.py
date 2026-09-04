@@ -49,6 +49,8 @@ SUB_NOTIFY       = "medcart/notify/telegram"
 SUB_PATIENT      = "medcart/patient/identified"
 SUB_VITALS_ALERT = "medcart/vitals/alert"
 SUB_STATUS       = "medcart/system/status"
+SUB_VITALS_READING = "medcart/vitals/reading"
+SUB_VITALS_ERROR   = "medcart/vitals/error"
 
 PUB_DISPENSE     = "medcart/dispense/request"     # updated topic
 PUB_MOVEMENT     = "medcart/movement/command"
@@ -77,7 +79,8 @@ def mqtt_publish(topic: str, payload: dict):
 def on_mqtt_connect(client, userdata, flags, reason_code, properties):
     if reason_code == 0:
         log.info("MQTT connected → %s:%d", MQTT_BROKER, MQTT_PORT)
-        for topic in [SUB_NOTIFY, SUB_PATIENT, SUB_VITALS_ALERT, SUB_STATUS]:
+        # Add the two new topics to this list
+        for topic in [SUB_NOTIFY, SUB_PATIENT, SUB_VITALS_ALERT, SUB_STATUS, SUB_VITALS_READING, SUB_VITALS_ERROR]:
             client.subscribe(topic, qos=1)
             log.info("Subscribed: %s", topic)
     else:
@@ -114,6 +117,26 @@ def on_mqtt_message(client, userdata, msg):
             message_queue.put("🔴 MedCart coordinator went offline.")
         elif status == "online":
             message_queue.put("✅ MedCart coordinator is online.")
+
+    elif topic == SUB_VITALS_READING:
+        hr = payload.get("heart_rate_bpm")
+        spo2 = payload.get("spo2_pct")
+        
+        # Only push if we actually got valid numbers
+        if hr is not None and spo2 is not None:
+            now_12hr = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
+            text = (
+                f"✅ <b>New Vitals Saved</b>\n"
+                f"💓 Heart rate: {hr} bpm\n"
+                f"🩸 SpO2: {spo2}%\n"
+                f"🕐 Recorded: {now_12hr}"
+            )
+            message_queue.put(text)
+
+    elif topic == SUB_VITALS_ERROR:
+        # Catch hardware timeouts if no finger is detected
+        error_msg = payload.get("error", "Finger not detected or signal too noisy.")
+        message_queue.put(f"⚠️ <b>Vitals Failed:</b> {error_msg}\nPlease adjust finger and try again.")
 
 
 def start_mqtt():
@@ -184,8 +207,6 @@ async def cmd_patient(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     vitals = p.get("latest_vitals")
     vitals_text = (
-        f"  🌡 Temp: {vitals.get('temperature_c', '—')}°C\n"
-        f"  💧 Humidity: {vitals.get('humidity_pct', '—')}%\n"
         f"  💓 HR: {vitals.get('heart_rate_bpm', '—')} bpm\n"
         f"  🩸 SpO2: {vitals.get('spo2_pct', '—')}%"
     ) if vitals else "  No vitals recorded yet"
@@ -199,40 +220,32 @@ async def cmd_patient(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
-
-async def cmd_dispense(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_vitals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not active_patient:
-        await update.message.reply_text("⚠️ No patient identified yet. Scan a wristband.")
+        await update.message.reply_text("⚠️ No patient identified yet.")
         return
 
-    p    = active_patient
-    slot = p.get("slot_number")
-
-    if not slot:
-        await update.message.reply_text(
-            f"⚠️ No tray slot assigned to {p['full_name']}.\n"
-            f"Update patient record with a slot number via admin.py."
-        )
+    vitals = active_patient.get("latest_vitals")
+    if not vitals:
+        await update.message.reply_text("No vitals recorded yet for this patient.")
         return
 
-    keyboard = [
-        [InlineKeyboardButton(
-            f"✅ Dispense tray for {p['full_name']} (Slot {slot})",
-            callback_data=f"dispense:{p['patient_id']}:{slot}"
-        )],
-        [InlineKeyboardButton("❌ Cancel", callback_data="dispense:cancel")]
-    ]
+    # Convert ISO time to 12-Hour AM/PM format
+    recorded = vitals.get('recorded_at', '—')
+    if recorded != '—':
+        try:
+            dt = datetime.fromisoformat(recorded)
+            recorded = dt.strftime("%Y-%m-%d %I:%M:%S %p")
+        except ValueError:
+            pass
 
     await update.message.reply_text(
-        f"💊 <b>Dispense medication tray</b>\n\n"
-        f"👤 Patient: {p['full_name']}\n"
-        f"🏥 Bed: {p['bed_number']}\n"
-        f"📦 Tray slot: {slot}\n\n"
-        f"⚠️ Bed must be confirmed by camera before dispensing.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        f"📊 <b>Latest Vitals — {active_patient['full_name']}</b>\n"
+        f"💓 Heart rate: {vitals.get('heart_rate_bpm', '—')} bpm\n"
+        f"🩸 SpO2: {vitals.get('spo2_pct', '—')}%\n"
+        f"🕐 Recorded: {recorded}",
         parse_mode="HTML"
     )
-
 
 async def cmd_vitals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not active_patient:
