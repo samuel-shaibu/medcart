@@ -133,13 +133,26 @@ def _check_bed_match(client: mqtt.Client) -> bool:
 
     if active_bed == patient_bed:
         log.info("Bed match confirmed: patient=%s bed=%s", active_patient.full_name, active_bed)
+        
+        # 1. Notify Telegram of automation
         notify(client,
                f"✅ Location confirmed — Bed {active_bed}\n"
                f"👤 {active_patient.full_name} is assigned here.\n"
-               f"⏱️ Taking vitals in 4 seconds. Place finger on sensor.",
+               f"⚙️ Auto-dispensing Slot {active_patient.slot_number}...\n"
+               f"⏱️ Taking vitals in 4 seconds.",
                level="info")
         
-        # Fire vitals trigger after grace period in a non-blocking thread
+        # 2. Fire Dispense Command Instantly
+        publish(client, PUB_DISPENSE_EXECUTE, {
+            "patient_id":   active_patient.patient_id,
+            "full_name":    active_patient.full_name,
+            "slot_number":  active_patient.slot_number,
+            "bed_confirmed": active_bed,
+            "requested_by": "auto",
+            "timestamp":    datetime.now().isoformat()
+        })
+        
+        # 3. Fire Vitals Trigger with Grace Period
         def delayed_trigger():
             time.sleep(4)
             publish(client, PUB_VITALS_TRIGGER, {
@@ -150,10 +163,6 @@ def _check_bed_match(client: mqtt.Client) -> bool:
             
         threading.Thread(target=delayed_trigger, daemon=True).start()
         return True
-    else:
-        log.warning("Bed mismatch: patient bed=%s, CV bed=%s", patient_bed, active_bed)
-        notify(client, f"⛔ WRONG BED. Camera sees: Bed {active_bed}", level="error")
-        return False
 
 # ─── RFID handler ─────────────────────────────────────────────────────────────
 
@@ -325,8 +334,8 @@ def handle_vitals_reading(client: mqtt.Client, payload: dict):
 
     log_vitals(
         patient_id,
-        temperature_c   = payload.get("temperature_c"),
-        humidity_pct    = payload.get("humidity_pct"),
+        #temperature_c   = payload.get("temperature_c"),
+        #humidity_pct    = payload.get("humidity_pct"),
         spo2_pct        = payload.get("spo2_pct"),
         heart_rate_bpm  = payload.get("heart_rate_bpm"),
         bp_systolic     = payload.get("bp_systolic"),
