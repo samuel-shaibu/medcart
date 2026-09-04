@@ -220,6 +220,39 @@ async def cmd_patient(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
+async def cmd_dispense(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not active_patient:
+        await update.message.reply_text("⚠️ No patient identified yet. Scan a wristband.")
+        return
+
+    p    = active_patient
+    slot = p.get("slot_number")
+
+    if not slot:
+        await update.message.reply_text(
+            f"⚠️ No tray slot assigned to {p['full_name']}.\n"
+            f"Update patient record with a slot number via admin.py."
+        )
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(
+            f"✅ Dispense tray for {p['full_name']} (Slot {slot})",
+            callback_data=f"dispense:{p['patient_id']}:{slot}"
+        )],
+        [InlineKeyboardButton("❌ Cancel", callback_data="dispense:cancel")]
+    ]
+
+    await update.message.reply_text(
+        f"💊 <b>Dispense medication tray</b>\n\n"
+        f"👤 Patient: {p['full_name']}\n"
+        f"🏥 Bed: {p['bed_number']}\n"
+        f"📦 Tray slot: {slot}\n\n"
+        f"⚠️ Bed must be confirmed by camera before dispensing.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML"
+    )
+
 async def cmd_vitals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not active_patient:
         await update.message.reply_text("⚠️ No patient identified yet.")
